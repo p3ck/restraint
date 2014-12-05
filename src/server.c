@@ -383,6 +383,15 @@ client_disconnected (SoupMessage *client_msg, gpointer data)
     //g_object_unref (client_msg);
 }
 
+static void
+server_abort_callback(SoupServer *server, SoupMessage *client_msg,
+                      const char *path, GHashTable *query,
+                      SoupClientContext *context, gpointer data)
+{
+    AppData *app_data = (AppData *)data;
+    g_cancellable_cancel(app_data->cancellable);
+}
+
 gboolean
 client_cb (GIOChannel *io, GIOCondition condition, gpointer user_data)
 {
@@ -581,6 +590,8 @@ int main(int argc, char *argv[]) {
                                server_control_callback, app_data, NULL);
       soup_server_add_handler (soup_server_ipv6, "/recipes",
                                server_recipe_callback, app_data, NULL);
+      soup_server_add_handler (soup_server_ipv6, "/abort",
+                               server_abort_callback, app_data, NULL);
       // Run the server
       soup_server_run_async (soup_server_ipv6);
   }
@@ -603,6 +614,8 @@ int main(int argc, char *argv[]) {
                                server_control_callback, app_data, NULL);
       soup_server_add_handler (soup_server_ipv4, "/recipes",
                                server_recipe_callback, app_data, NULL);
+      soup_server_add_handler (soup_server_ipv6, "/abort",
+                               server_abort_callback, app_data, NULL);
       // Run the server
       soup_server_run_async (soup_server_ipv4);
   }
