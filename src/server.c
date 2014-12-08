@@ -389,6 +389,16 @@ server_abort_callback(SoupServer *server, SoupMessage *client_msg,
                       SoupClientContext *context, gpointer data)
 {
     AppData *app_data = (AppData *)data;
+
+    if (app_data->state == RECIPE_IDLE) {
+      soup_message_set_status_full(client_msg, SOUP_STATUS_BAD_REQUEST,
+                                   "No Recipe Running");
+      return;
+    } else {
+      soup_message_set_status (client_msg, SOUP_STATUS_OK);
+    }
+
+    app_data->aborted = TRUE;
     g_cancellable_cancel(app_data->cancellable);
 }
 
@@ -403,6 +413,7 @@ client_cb (GIOChannel *io, GIOCondition condition, gpointer user_data)
     g_cancellable_cancel (app_data->cancellable);
     // We exit FALSE so update app_data->io_handler to know we are gone.
     app_data->io_handler_id = 0;
+    app_data->aborted = FALSE;
     client_disconnected (client_data->client_msg, app_data);
     return FALSE;
 }
@@ -508,6 +519,7 @@ on_signal_term (gpointer user_data)
 int main(int argc, char *argv[]) {
   AppData *app_data = g_slice_new0(AppData);
   app_data->cancellable = g_cancellable_new ();
+  app_data->aborted = FALSE;
   gint port = 8081;
   app_data->config_file = NULL;
   gchar *config_port = g_strdup("config.conf");
