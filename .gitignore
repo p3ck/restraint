@@ -39,3 +39,5 @@
 /src/*.o
 rel-eng/lib/*.pyc
 /docs/_build
+tags
+cscope.out
