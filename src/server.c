@@ -337,46 +337,52 @@ server_recipe_callback (SoupServer *server, SoupMessage *client_msg,
     } else if (g_str_has_suffix(path, "status")) {
         gchar **splitpath = g_strsplit(path, "/", -1);
         guint pathlen = g_strv_length(splitpath);
-        if (g_strcmp0(*(splitpath + pathlen - 3), "recipes") == 0) {
-          if (g_strcmp0(*(splitpath + pathlen - 2),
-                app_data->recipe->recipe_id) == 0) {
-            if (g_str_has_suffix(client_msg->request_body->data, "Aborted")) {
-              app_data->aborted = ABORTED_RECIPE;
-              g_cancellable_cancel(app_data->cancellable);
-              soup_message_set_status (client_msg, SOUP_STATUS_OK);
-            } else {
-              soup_message_set_status_full (client_msg,
-                  SOUP_STATUS_BAD_REQUEST, "Unknown status");
-            }
-          } else {
-              soup_message_set_status_full (client_msg,
-                  SOUP_STATUS_BAD_REQUEST, "Wrong recipe id");
-          }
-        } else if (g_strcmp0(*(splitpath + pathlen - 3), "tasks") == 0) {
-          gchar *recipe_id = *(splitpath + pathlen - 4);
-          gchar *task_id = *(splitpath + pathlen - 2);
-          if (g_strcmp0(recipe_id, app_data->recipe->recipe_id) == 0) {
-            if (g_strcmp0(task_id, task->task_id) == 0) {
-              if (g_str_has_suffix(client_msg->request_body->data, "Aborted")) {
-                app_data->aborted = ABORTED_TASK;
-                g_cancellable_cancel(app_data->cancellable);
-                soup_message_set_status (client_msg, SOUP_STATUS_OK);
-              } else {
-                soup_message_set_status_full (client_msg,
-                    SOUP_STATUS_BAD_REQUEST, "Unknown status");
-              }
-            } else {
-              soup_message_set_status_full (client_msg,
-                  SOUP_STATUS_BAD_REQUEST, "Wrong task id");
-            }
-          } else {
-              soup_message_set_status_full (client_msg,
-                  SOUP_STATUS_BAD_REQUEST, "Wrong recipe id");
-          }
-        } else {
-          soup_message_set_status_full (client_msg,
-              SOUP_STATUS_BAD_REQUEST, "Malformed status url");
+        gchar *type = *(splitpath + pathlen - 3);
+        gchar *recipe_id = NULL;
+        gchar *task_id = NULL;
+
+        // Currently supporting only "Aborted" status
+        if (!g_str_has_suffix(client_msg->request_body->data, "Aborted")) {
+          soup_message_set_status_full(client_msg, SOUP_STATUS_BAD_REQUEST,
+                                       "Unknown status");
+          goto status_cleanup;
         }
+
+        if (g_strcmp0(type, "recipes") == 0) {
+          recipe_id = *(splitpath + pathlen - 2);
+        } else if (g_strcmp0(type, "tasks") == 0) {
+          task_id = *(splitpath + pathlen - 2);
+          recipe_id = *(splitpath + pathlen - 4);
+        } else {
+          soup_message_set_status_full(client_msg, SOUP_STATUS_BAD_REQUEST,
+                                       "Malformed status url");
+          goto status_cleanup;
+        }
+
+        if (recipe_id != NULL && g_strcmp0(recipe_id,
+                                 app_data->recipe->recipe_id) != 0) {
+          soup_message_set_status_full(client_msg, SOUP_STATUS_BAD_REQUEST,
+                                       "Wrong recipe id");
+          goto status_cleanup;
+        }
+
+        if (task_id != NULL && g_strcmp0(task_id, task->task_id) != 0) {
+          soup_message_set_status_full(client_msg, SOUP_STATUS_BAD_REQUEST,
+                                       "Wrong task id");
+          goto status_cleanup;
+        }
+
+        if (task_id != NULL && recipe_id != NULL) {
+          app_data->aborted = ABORTED_TASK;
+          g_cancellable_cancel(app_data->cancellable);
+          soup_message_set_status (client_msg, SOUP_STATUS_OK);
+        } else if (recipe_id != NULL) {
+          app_data->aborted = ABORTED_RECIPE;
+          g_cancellable_cancel(app_data->cancellable);
+          soup_message_set_status (client_msg, SOUP_STATUS_OK);
+        }
+
+status_cleanup:
         g_strfreev(splitpath);
         g_slice_free (ClientData, client_data);
         return;
