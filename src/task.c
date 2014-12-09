@@ -585,7 +585,7 @@ restraint_next_task (AppData *app_data, TaskSetupState task_state) {
 
     // No more tasks, let the recipe_handler know we are done.
     app_data->state = RECIPE_COMPLETE;
-    app_data->aborted = FALSE;
+    app_data->aborted = ABORTED_NONE;
     app_data->recipe_handler_id = g_idle_add_full(G_PRIORITY_DEFAULT_IDLE,
                                                   recipe_handler,
                                                   app_data,
@@ -851,17 +851,15 @@ task_handler (gpointer user_data)
       }
       break;
     case TASK_ABORTED:
-      if (g_cancellable_is_cancelled(app_data->cancellable)) {
-        for (GList *ctask = app_data->tasks; ctask != NULL;
-             ctask = g_list_next(ctask)) {
-          Task *ntask = (Task*)ctask->data;
-          if (task != ntask) {
-            GError *aborted = g_error_new(RESTRAINT_ERROR,
-                                          RESTRAINT_TASK_RUNNER_ABORTED,
-                                          "Aborted by rstrnt-abort");
-            restraint_task_status(ntask, app_data, "Aborted", aborted);
-            g_clear_error(&aborted);
-          }
+      for (GList *ctask = app_data->tasks; ctask != NULL;
+           ctask = g_list_next(ctask)) {
+        Task *ntask = (Task*)ctask->data;
+        if (task != ntask) {
+          GError *aborted = g_error_new(RESTRAINT_ERROR,
+                                        RESTRAINT_TASK_RUNNER_ABORTED,
+                                        "Aborted by rstrnt-abort");
+          restraint_task_status(ntask, app_data, "Aborted", aborted);
+          g_clear_error(&aborted);
         }
       }
       task->state = TASK_NEXT;
@@ -870,7 +868,7 @@ task_handler (gpointer user_data)
     case TASK_COMPLETE:
       // Set task finished
       if (g_cancellable_is_cancelled(app_data->cancellable) &&
-          app_data->aborted) {
+          app_data->aborted != ABORTED_NONE) {
         g_clear_error(&task->error);
         g_set_error(&task->error, RESTRAINT_ERROR,
                     RESTRAINT_TASK_RUNNER_ABORTED,
@@ -896,11 +894,19 @@ task_handler (gpointer user_data)
       }
       // Rmeove the entire [task] section from the config.
       restraint_config_set (app_data->config_file, task->task_id, NULL, NULL, -1);
-      if (g_cancellable_is_cancelled(app_data->cancellable) && app_data->aborted) {
+      if (g_cancellable_is_cancelled(app_data->cancellable) &&
+          app_data->aborted == ABORTED_RECIPE) {
         task->state = TASK_ABORTED;
       } else {
         task->state = TASK_NEXT;
       }
+
+      if (g_cancellable_is_cancelled(app_data->cancellable) &&
+          app_data->aborted == ABORTED_TASK) {
+        g_cancellable_reset(app_data->cancellable);
+      }
+
+      app_data->aborted = ABORTED_NONE;
       result = FALSE;
       break;
     }

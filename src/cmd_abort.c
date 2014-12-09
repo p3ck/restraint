@@ -30,9 +30,12 @@ int main(int argc, char *argv[]) {
     GError *error = NULL;
 
     gchar *server = NULL;
-    gchar *abrt_url = NULL;
     SoupURI *server_uri = NULL;
     guint ret = 0;
+
+    gchar *prefix = NULL;
+    gchar *server_recipe_key = NULL;
+    gchar *server_recipe = NULL;
 
     GOptionEntry entries[] = {
         {"server", 's', 0, G_OPTION_ARG_STRING, &server,
@@ -41,7 +44,10 @@ int main(int argc, char *argv[]) {
     };
     GOptionContext *context = g_option_context_new(NULL);
     g_option_context_set_summary(context,
-            "Aborts currently running task.\n");
+            "Aborts currently running task. if you don't specify the\n"
+            "the server url you must have RECIPEID defined.\n"
+            "If HARNESS_PREFIX is defined then the value of that must be\n"
+            "prefixed to RECIPEID");
     g_option_context_add_main_entries(context, entries, NULL);
     gboolean parse_succeeded = g_option_context_parse(context, &argc, &argv, &error);
 
@@ -49,13 +55,21 @@ int main(int argc, char *argv[]) {
         goto cleanup;
     }
 
+    prefix = getenv("HARNESS_PREFIX") ? getenv("HARNESS_PREFIX") : "";
+    server_recipe_key = g_strdup_printf ("%sRECIPE_URL", prefix);
+    server_recipe = getenv(server_recipe_key);
+    g_free(server_recipe_key);
+
+    if (!server && server_recipe) {
+        server = g_strdup_printf ("%s/status", server_recipe);
+    }
+
     if (!server) {
         cmd_usage(context);
         goto cleanup;
     }
 
-    abrt_url = g_strdup_printf ("%s/abort", server);
-    server_uri = soup_uri_new(abrt_url);
+    server_uri = soup_uri_new(server);
     if (!server_uri) {
         g_set_error (&error, RESTRAINT_ERROR,
                      RESTRAINT_PARSE_ERROR_BAD_SYNTAX,
@@ -63,7 +77,10 @@ int main(int argc, char *argv[]) {
         goto cleanup;
     }
     session = soup_session_new_with_options("timeout", 3600, NULL);
-    SoupMessage *msg = soup_message_new_from_uri("GET", server_uri);
+    SoupMessage *msg = soup_message_new_from_uri("POST", server_uri);
+    char *form = soup_form_encode("status", "Aborted", NULL);
+    soup_message_set_request (msg, "application/x-www-form-urlencoded",
+                              SOUP_MEMORY_TAKE, form, strlen (form));
     ret = soup_session_send_message(session, msg);
     if (!SOUP_STATUS_IS_SUCCESSFUL(ret)) {
         g_warning ("Failed to abort job, status: %d Message: %s\n", ret,
