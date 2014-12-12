@@ -694,9 +694,11 @@ task_handler (gpointer user_data)
     case TASK_IDLE:
       // Read in previous state..
       if (parse_task_config (app_data->config_file, task, &task->error)) {
-          if (task->finished || g_cancellable_is_cancelled (app_data->cancellable)) {
+          if (task->finished) {
               // If the task is finished skip to the next task.
               task->state = TASK_NEXT;
+          } else if (g_cancellable_is_cancelled (app_data->cancellable)) {
+              task->state = TASK_COMPLETE;
           } else if (task->localwatchdog) {
               // If the task is not finished but localwatchdog expired.
               g_string_printf(message, "** Localwatchdog task: %s [%s]\n", task->task_id, task->path);
@@ -850,21 +852,6 @@ task_handler (gpointer user_data)
                                 task->reboots + 1);
       }
       break;
-    case TASK_ABORTED:
-      for (GList *ctask = app_data->tasks; ctask != NULL;
-           ctask = g_list_next(ctask)) {
-        Task *ntask = (Task*)ctask->data;
-        if (task != ntask) {
-          GError *aborted = g_error_new(RESTRAINT_ERROR,
-                                        RESTRAINT_TASK_RUNNER_ABORTED,
-                                        "Aborted by rstrnt-abort");
-          restraint_task_status(ntask, app_data, "Aborted", aborted);
-          g_clear_error(&aborted);
-        }
-      }
-      task->state = TASK_NEXT;
-      result = FALSE;
-      break;
     case TASK_COMPLETE:
       // Set task finished
       if (g_cancellable_is_cancelled(app_data->cancellable) &&
@@ -894,19 +881,13 @@ task_handler (gpointer user_data)
       }
       // Rmeove the entire [task] section from the config.
       restraint_config_set (app_data->config_file, task->task_id, NULL, NULL, -1);
-      if (g_cancellable_is_cancelled(app_data->cancellable) &&
-          app_data->aborted == ABORTED_RECIPE) {
-        task->state = TASK_ABORTED;
-      } else {
-        task->state = TASK_NEXT;
-      }
+      task->state = TASK_NEXT;
 
       if (g_cancellable_is_cancelled(app_data->cancellable) &&
           app_data->aborted == ABORTED_TASK) {
+          app_data->aborted = ABORTED_NONE;
         g_cancellable_reset(app_data->cancellable);
       }
-
-      app_data->aborted = ABORTED_NONE;
       result = FALSE;
       break;
     }
