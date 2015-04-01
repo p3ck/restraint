@@ -15,7 +15,6 @@
     along with Restraint.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-#define DEFAULT_PORT 8081
 #define DEFAULT_DELAY 60
 
 struct _AppData;
@@ -32,12 +31,12 @@ typedef struct {
     xmlNodePtr recipe_node_ptr;
     GHashTable *tasks;
     guint recipe_id;
-    SoupURI *remote_uri;
-    SoupMessage *remote_msg;
+    gchar *host;
     struct _AppData *app_data;
     GString *body;
     GCancellable *cancellable;
     guint timeout_handler_id;
+    gboolean started;
 } RecipeData;
 
 typedef struct {
@@ -53,10 +52,6 @@ typedef struct _AppData {
     GHashTable *result_states_to;
     GHashTable *recipes;
     gint verbose;
-    guint port;
-    SoupAddressFamily address_family;
-    SoupURI *addr_get_uri;
     GCancellable *cancellable;
-    gboolean started;
     GSList *regexes;
 } AppData;

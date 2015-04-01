@@ -1,9 +1,36 @@
+#include <string.h>
 #include <glib.h>
+#include <gio/gunixinputstream.h>
 #include <libsoup/soup.h>
+#include "pipe.h"
 #include "multipart.h"
 #include "errors.h"
 
 static void next_part_cb (GObject *source, GAsyncResult *async_result, gpointer user_data);
+// Taken from libsoup
+static char *
+generate_boundary (void)
+{
+        static int counter;
+        struct {
+                GTimeVal timeval;
+                int counter;
+        } data;
+
+        /* avoid valgrind warning */
+        if (sizeof (data) != sizeof (data.timeval) + sizeof (data.counter))
+                memset (&data, 0, sizeof (data));
+
+        g_get_current_time (&data.timeval);
+        data.counter = counter++;
+
+        /* The maximum boundary string length is 69 characters, and a
+         * stringified SHA256 checksum is 64 bytes long.
+         */
+        return g_compute_checksum_for_data (G_CHECKSUM_SHA256,
+                                            (const guchar *)&data,
+                                            sizeof (data));
+}
 
 static void
 multipart_destroy (MultiPartData *multipart_data)
@@ -39,7 +66,6 @@ close_base_cb (GObject *source,
           GAsyncResult *async_result,
           gpointer user_data)
 {
-    MultiPartData *multipart_data = (MultiPartData *) user_data;
     GError *error = NULL;
     g_input_stream_close_finish (G_INPUT_STREAM (source), async_result, &error);
     if (error) {
@@ -48,7 +74,6 @@ close_base_cb (GObject *source,
                    error->code);
         g_error_free (error);
     }
-    multipart_destroy (multipart_data);
 }
 
 /*
@@ -170,66 +195,158 @@ next_part_cb (GObject *source, GAsyncResult *async_result, gpointer user_data)
     //g_print ("next_part_cb: Exit\n");
 }
 
-/*
- * our multipart handler callback
- * If we make an invalid request (like trying to cancel when no recipe is running)
- * then status_code will not be 200 and we will exit out after propagating the error
- * to our own GError
- */
-static void
-request_sent_cb (GObject *source, GAsyncResult *async_result, gpointer user_data)
+void
+multipart_handler_async (SoupMessage *msg,
+                         gint f_in,
+                         MultiPartData *multipart_data)
 {
-
-    //g_print ("request_sent_cb\n");
-    MultiPartData *multipart_data = (MultiPartData *) user_data;
-
-    SoupRequest *request = SOUP_REQUEST (source);
-    GInputStream *in = soup_request_send_finish (request,
-                                                 async_result,
-                                                 &multipart_data->error);
-    if (multipart_data->error) {
-        g_object_unref(request);
-        multipart_destroy (multipart_data);
-        return;
-    }
-
-    SoupMessage *message = soup_request_http_get_message (SOUP_REQUEST_HTTP (request));
-    g_object_unref(request);
-
-    if (message->status_code != SOUP_STATUS_OK) {
-        g_set_error_literal(&multipart_data->error,
-                            RESTRAINT_ERROR,
-                            message->status_code,
-                            message->reason_phrase);
-        multipart_destroy (multipart_data);
-        return;
-    }
-
-    multipart_data->multipart = soup_multipart_input_stream_new (message,
+    GInputStream *in = g_unix_input_stream_new (f_in, TRUE /* close_fd */);
+    multipart_data->multipart = soup_multipart_input_stream_new (msg,
                                                                  in);
-    g_object_unref (message);
     g_object_unref (in);
 
     soup_multipart_input_stream_next_part_async (multipart_data->multipart,
                                                  G_PRIORITY_DEFAULT,
                                                  multipart_data->cancellable,
                                                  next_part_cb,
-                                                 user_data);
+                                                 multipart_data);
+}
+
+static void
+post_data (gint fd, const gchar *remote_path, const gchar *data, gsize data_len)
+{
+    gchar *boundary = generate_boundary();
+    gchar *header = g_strdup_printf ("POST %s HTTP/1.1\r\nContent-Length: %zu\r\nContent-Type: multipart/x-mixed-replace; boundary=--%s\r\n\r\n", remote_path, data_len + strlen(boundary) + 3, boundary);
+    write (fd, header, strlen(header));
+    write (fd, data, data_len);
+    write (fd, "--", 2);
+    write (fd, boundary, strlen(boundary));
+    write (fd, "\n", 1);
+}
+
+static gboolean
+handshake_io_cb (GIOChannel *io, GIOCondition condition, gpointer user_data)
+{
+    HandshakeData *handshake_data = (HandshakeData *) user_data;
+    GError *tmp_error = NULL;
+    gchar *s = NULL;
+    gsize length = 0;
+    gsize terminator_pos = 0;
+    if (condition & G_IO_IN) {
+        switch (g_io_channel_read_line (io, &s, &length, &terminator_pos, &tmp_error)) {
+            case G_IO_STATUS_NORMAL:
+                switch (handshake_data->state) {
+                    case HANDSHAKE:
+                        // Look for the handshake first before posting job
+                        // User-Agent: restraint/11
+                        // We might want to check the protocol number in the future
+                        if (g_str_has_prefix (s, "User-Agent: restraint/")) {
+                            post_data(handshake_data->f_out, handshake_data->remote_path,
+                                      handshake_data->data, handshake_data->data_len);
+                            handshake_data->state = READ_HEADER;
+                        }
+                        break;
+                    case READ_HEADER:
+                        // Read response and setup multi-part handling
+                        if (terminator_pos == 0) {
+                            soup_headers_parse_response (handshake_data->response_str->str,
+                                                         handshake_data->response_str->len,
+                                                         handshake_data->msg->response_headers,
+                                                         NULL,
+                                                         &handshake_data->msg->status_code,
+                                                         &handshake_data->msg->reason_phrase);
+                            handshake_data->state = RUN;
+                            multipart_handler_async (handshake_data->msg,
+                                                     handshake_data->f_in,
+                                                     handshake_data->multipart_data);
+                            // remove this I/O handler
+                            return FALSE;
+                        } else {
+                            g_string_append_len (handshake_data->response_str, s, length);
+                        }
+                        break;
+                    default:
+                        // we shouldn't get here..
+                        g_print ("client:%s", s);
+                        break;
+                }
+                return TRUE;
+            case G_IO_STATUS_ERROR:
+                g_printerr("IO error: %s\n", tmp_error->message);
+                g_clear_error (&tmp_error);
+                return FALSE;
+            case G_IO_STATUS_EOF:
+                g_print ("finished!\n");
+                return FALSE;
+            case G_IO_STATUS_AGAIN:
+                g_warning ("Not ready.. try again.");
+                return TRUE;
+            default:
+                g_return_val_if_reached (FALSE);
+                break;
+        }
+    }
+    return FALSE;
 }
 
 void
-multipart_request_send_async (SoupRequest *request,
-                              GCancellable *cancellable,
-                              MultiPartCallback callback,
-                              MultiPartDestroy destroy,
-                              gpointer user_data)
+handshake_pid_callback (GPid pid, gint status, gpointer user_data)
 {
+    HandshakeData *handshake_data = (HandshakeData *) user_data;
+    g_print ("handshake_pid_callback\n");
+    if (handshake_data->f_in != -1) {
+        close (handshake_data->f_in);
+        handshake_data->f_in = -1;
+    }
+    if (handshake_data->f_out != -1) {
+        close (handshake_data->f_out);
+        handshake_data->f_out = -1;
+    }
+    multipart_destroy (handshake_data->multipart_data);
+    g_free (handshake_data->data);
+    g_slice_free (HandshakeData, handshake_data);
+}
+
+void
+multipart_start_async (gchar **remote_cmd,
+                       gchar *data,
+                       gsize data_len,
+                       gchar *remote_path,
+                       GCancellable *cancellable,
+                       MultiPartCallback callback,
+                       MultiPartDestroy destroy,
+                       gpointer user_data)
+{
+    HandshakeData *handshake_data = g_slice_new0 (HandshakeData);
+    SoupMessage *msg;
+    msg = g_object_new (SOUP_TYPE_MESSAGE, NULL);
+    handshake_data->msg = msg;
+    handshake_data->response_str = g_string_new (NULL);
+    handshake_data->data = g_strdup(data);
+    handshake_data->data_len = data_len;
+    handshake_data->remote_path = remote_path;
+
     MultiPartData *multipart_data = g_slice_new0 (MultiPartData);
     multipart_data->callback = callback;
     multipart_data->destroy = destroy;
     multipart_data->user_data = user_data;
     multipart_data->cancellable = cancellable;
     multipart_data->buffer = NULL;
+    handshake_data->multipart_data = multipart_data;
 
-    soup_request_send_async(request, cancellable, request_sent_cb, multipart_data);
+    handshake_data->pid = piped_child (remote_cmd, &handshake_data->f_in, &handshake_data->f_out);
+    g_child_watch_add_full (G_PRIORITY_DEFAULT,
+                            handshake_data->pid,
+                            handshake_pid_callback,
+                            handshake_data,
+                            NULL);
+
+    handshake_data->io = g_io_channel_unix_new (handshake_data->f_in);
+    g_io_channel_set_flags (handshake_data->io, G_IO_FLAG_NONBLOCK, NULL);
+    g_io_add_watch_full (handshake_data->io,
+                         G_PRIORITY_DEFAULT,
+                         G_IO_IN | G_IO_ERR | G_IO_HUP | G_IO_NVAL,
+                         handshake_io_cb,
+                         handshake_data,
+                         NULL);
 }

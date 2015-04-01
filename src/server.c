@@ -178,21 +178,6 @@ void
 recipe_handler_finish (gpointer user_data)
 {
     AppData *app_data = (AppData *) user_data;
-    ClientData *client_data = app_data->message_data;
-
-    if (client_data) {
-        if (app_data->error) {
-            soup_message_set_status_full (client_data->client_msg,
-                                          SOUP_STATUS_BAD_REQUEST,
-                                          app_data->error->message);
-        } else {
-            soup_message_set_status (client_data->client_msg, SOUP_STATUS_OK);
-        }
-        soup_message_body_append (client_data->client_msg->response_body,
-                                  SOUP_MEMORY_STATIC,
-                                  "\r\n--cut-here\n", 13);
-        soup_server_unpause_message (client_data->server, client_data->client_msg);
-    }
     g_clear_error (&app_data->error);
 }
 
@@ -417,115 +402,40 @@ status_cleanup:
     soup_server_pause_message (server, client_msg);
 }
 
-static void
-client_disconnected (SoupMessage *client_msg, gpointer data)
-{
-    AppData *app_data = (AppData *) data;
-    ClientData *client_data = (ClientData *) app_data->message_data;
-
-    g_print ("[%p] Client disconnected\n", client_msg);
-    if (app_data->finished_handler_id != 0) {
-        g_signal_handler_disconnect (client_msg, app_data->finished_handler_id);
-        app_data->finished_handler_id = 0;
-    }
-    if (app_data->io_handler_id != 0) {
-        g_source_remove (app_data->io_handler_id);
-        app_data->io_handler_id = 0;
-    }
-    g_io_channel_unref(app_data->io_chan);
-    app_data->message_data = NULL;
-    g_slice_free(ClientData, client_data);
-    //g_object_unref (client_msg);
-}
-
-gboolean
-client_cb (GIOChannel *io, GIOCondition condition, gpointer user_data)
-{
-    // This is just to help libsoup "notice" that the client
-    // has disconnectd
-    AppData *app_data = (AppData *) user_data;
-    ClientData *client_data = (ClientData *) app_data->message_data;
-    // Cancel any running tasks
-    g_cancellable_cancel (app_data->cancellable);
-    // We exit FALSE so update app_data->io_handler to know we are gone.
-    app_data->io_handler_id = 0;
-    app_data->aborted = ABORTED_NONE;
-    client_disconnected (client_data->client_msg, app_data);
-    return FALSE;
-}
-
-static void
-server_control_callback (SoupServer *server, SoupMessage *client_msg,
-                     const char *path, GHashTable *query,
-                     SoupClientContext *context, gpointer data)
-{
-    AppData *app_data = (AppData *) data;
-
-    // Only accept POST requests for running recipes
-    if (client_msg->method != SOUP_METHOD_POST ) {
-        soup_message_set_status_full (client_msg, SOUP_STATUS_BAD_REQUEST, "only POST accepted");
-        return;
-    }
-
-    if (app_data->state != RECIPE_IDLE) {
-        soup_message_set_status_full (client_msg, SOUP_STATUS_BAD_REQUEST, "Already running a recipe.");
-        return;
-    }
-
-    // Attempt to run or continue a recipe if requested.
-    if (g_str_has_suffix (path, "/run")) {
-        restraint_config_trunc (app_data->config_file, NULL);
-    }
-
-    // Monitor the socket, if the client disconnects
-    // it sets G_IO_IN, without this we won't notice
-    // the client going away until we try to write to it
-    GSocket *socket = soup_client_context_get_gsocket (context);
-    gint fd = g_socket_get_fd (socket);
-    app_data->io_chan = g_io_channel_unix_new(fd);
-    app_data->io_handler_id = g_io_add_watch (app_data->io_chan,
-                    G_IO_IN,
-                    client_cb,
-                    app_data);
-
-    soup_message_body_set_accumulate (client_msg->response_body, FALSE);
-    // Record our client data..
-    ClientData *client_data = g_slice_new0 (ClientData);
-    client_data->path = path;
-    client_data->client_msg = client_msg;
-    client_data->server = server;
-    app_data->message_data = client_data;
-    app_data->queue_message = (QueueMessage) restraint_append_message;
-    app_data->close_message = (CloseMessage) restraint_close_message;
-    app_data->state = RECIPE_FETCHING;
-
-    GInputStream *stream = g_memory_input_stream_new_from_data (client_msg->request_body->data,
-                                                                client_msg->request_body->length,
-                                                                NULL);
-    // parse the xml from the stream
-    restraint_recipe_parse_stream (stream, app_data);
-
-    // Add recipe handler
-    app_data->recipe_handler_id = g_idle_add_full(G_PRIORITY_DEFAULT_IDLE,
-                                                  recipe_handler,
-                                                  app_data,
-                                                  recipe_handler_finish);
-
-    // If the client disconnects we stop running the recipe.
-    app_data->finished_handler_id = g_signal_connect (client_msg,
-                                                      "finished",
-                                                      G_CALLBACK (client_disconnected),
-                                                      app_data);
-
-    soup_message_headers_set_encoding (client_msg->response_headers,
-                                       SOUP_ENCODING_EOF);
-    soup_message_headers_append (client_msg->response_headers,
-                                 "Content-Type", "multipart/x-mixed-replace; boundary=--cut-here");
-    // pause message until we start the recipe.
-    // if anything goes wrong we set the status to BAD_REQUEST and close
-    // the connection
-    soup_server_pause_message (server, client_msg);
-}
+//static void
+//server_control_callback (SoupServer *server, SoupMessage *client_msg,
+//                     const char *path, GHashTable *query,
+//                     SoupClientContext *context, gpointer data)
+//{
+//    AppData *app_data = (AppData *) data;
+//
+//    // Attempt to run or continue a recipe if requested.
+//    if (g_str_has_suffix (path, "/run")) {
+//        restraint_config_trunc (app_data->config_file, NULL);
+//    }
+//
+//    // Record our client data..
+//    ClientData *client_data = g_slice_new0 (ClientData);
+//    client_data->path = path;
+//    client_data->client_msg = client_msg;
+//    client_data->server = server;
+//    app_data->message_data = client_data;
+//    app_data->queue_message = (QueueMessage) restraint_append_message;
+//    app_data->close_message = (CloseMessage) restraint_close_message;
+//    app_data->state = RECIPE_FETCHING;
+//
+//    GInputStream *stream = g_memory_input_stream_new_from_data (client_msg->request_body->data,
+//                                                                client_msg->request_body->length,
+//                                                                NULL);
+//    // parse the xml from the stream
+//    restraint_recipe_parse_stream (stream, app_data);
+//
+//    // Add recipe handler
+//    app_data->recipe_handler_id = g_idle_add_full(G_PRIORITY_DEFAULT_IDLE,
+//                                                  recipe_handler,
+//                                                  app_data,
+//                                                  NULL);
+//}
 
 gboolean
 quit_loop_handler (gpointer user_data)
@@ -612,16 +522,12 @@ int main(int argc, char *argv[]) {
   soup_server = soup_server_new(SOUP_SERVER_SERVER_HEADER, "restraint ", NULL);
 
   // Add the handlers
-  soup_server_add_handler (soup_server, "/run",
-                           server_control_callback, app_data, NULL);
-  soup_server_add_handler (soup_server, "/continue",
-                           server_control_callback, app_data, NULL);
   soup_server_add_handler (soup_server, "/recipes",
                            server_recipe_callback, app_data, NULL);
 
   // Tell our soup server to listen on any interface
   // This includes ipv4 and ipv6 if available.
-  if (! soup_server_listen_all (soup_server, port, 0, NULL)) {
+  if (! soup_server_listen_local (soup_server, port, 0, NULL)) {
       g_printerr ("Unable to bind to server port %d\n", port);
       exit (1);
   }

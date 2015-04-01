@@ -40,8 +40,6 @@
 #include "errors.h"
 #include "xml.h"
 
-static SoupSession *session;
-
 static void recipe_finish(RecipeData *recipe_data);
 static gboolean run_recipe_handler (gpointer user_data);
 
@@ -50,7 +48,6 @@ static void restraint_free_recipe_data(RecipeData *recipe_data)
     if (recipe_data->tasks != NULL) {
         g_hash_table_destroy(recipe_data->tasks);
     }
-    soup_uri_free(recipe_data->remote_uri);
     g_string_free(recipe_data->body, TRUE);
     g_slice_free(RecipeData, recipe_data);
 }
@@ -235,22 +232,15 @@ remote_hup (GError *error,
 {
     RecipeData *recipe_data = (RecipeData *) user_data;
     AppData *app_data = recipe_data->app_data;
-    gchar *full_url = NULL;
-    SoupURI *continue_uri = NULL;
 
     // If we get an error on the first connection then we simply abort
-    if (app_data->started && ! tasks_finished(app_data->xml_doc, recipe_data->recipe_node_ptr, (xmlChar *)"task")
+    if (recipe_data->started && ! tasks_finished(app_data->xml_doc, recipe_data->recipe_node_ptr, (xmlChar *)"task")
                           && ! g_cancellable_is_cancelled(recipe_data->cancellable)) {
         if (error) {
             g_print ("%s [%s, %d]\n", error->message,
                      g_quark_to_string (error->domain), error->code);
         }
-        continue_uri = soup_uri_new_with_base (recipe_data->remote_uri, "/continue");
-        soup_uri_free (recipe_data->remote_uri);
-        recipe_data->remote_uri = continue_uri;
-        full_url = soup_uri_to_string (recipe_data->remote_uri, FALSE);
         g_print ("Disconnected.. delaying %d seconds.\n", DEFAULT_DELAY);
-        g_free (full_url);
         // Try and re-connect to the other host
         g_timeout_add_seconds_full (G_PRIORITY_DEFAULT,
                                     DEFAULT_DELAY,
@@ -286,8 +276,6 @@ tasks_results_cb (const char *method,
     entries = g_strsplit (path, "/", 0);
     task_id = g_strdup (entries[4]);
     recipe_id = g_strdup (entries[2]);
-
-    app_data->started = TRUE;
 
     // Lookup our task
     xmlNodePtr task_node_ptr = g_hash_table_lookup(recipe_data->tasks,
@@ -396,8 +384,6 @@ tasks_status_cb (const char *method,
     task_id = g_strdup (entries[4]);
     recipe_id = g_strdup (entries[2]);
 
-    app_data->started = TRUE;
-
     // Lookup our task
     xmlNodePtr task_node_ptr = g_hash_table_lookup(recipe_data->tasks,
                                                    task_id);
@@ -477,8 +463,6 @@ tasks_logs_cb (const char *method,
     entries = g_strsplit (path, "/", 0);
     task_id = g_strdup (entries[4]);
     recipe_id = g_strdup (entries[2]);
-
-    app_data->started = TRUE;
 
     // Lookup our task
     xmlNodePtr task_node_ptr = g_hash_table_lookup(recipe_data->tasks,
@@ -623,6 +607,8 @@ message_cb (const char *method,
     RecipeData *recipe_data = (RecipeData*) user_data;
     AppData *app_data = recipe_data->app_data;
     RegexCallback callback;
+
+    recipe_data->started = TRUE;
 
     // path must be defined in order to dispatch
     if (!path)
@@ -827,32 +813,24 @@ run_recipe_handler (gpointer user_data)
 {
     RecipeData *recipe_data = (RecipeData*)user_data;
     AppData *app_data = recipe_data->app_data;
-    gchar *full_url = NULL;
+    gchar *remote_path = "/run";
     // Tell restraintd to run our recipe
-    SoupRequest *request;
-    request = (SoupRequest *)soup_session_request_http_uri(session,
-                                                           "POST",
-                                                           recipe_data->remote_uri,
-                                                           NULL);
-    recipe_data->remote_msg = soup_request_http_get_message(
-            SOUP_REQUEST_HTTP(request));
 
     // return the xml doc
     xmlBufferPtr buffer = xmlBufferCreate();
     gint size = xmlNodeDump(buffer, app_data->xml_doc, recipe_data->recipe_node_ptr, 0, 1);
 
-    full_url = soup_uri_to_string (recipe_data->remote_uri, FALSE);
-    g_print ("Connecting to %s for recipe id:%d\n", full_url, recipe_data->recipe_id);
-    g_free (full_url);
-    soup_message_set_request (recipe_data->remote_msg,
-                              "text/xml",
-                              SOUP_MEMORY_COPY, (const char *) buffer->content, size);
+    g_print ("Connecting to %s for recipe id:%d\n", recipe_data->host, recipe_data->recipe_id);
+    gchar *remote_command[] = {"ssh", recipe_data->host, "restraintd", "--server", NULL };
+    multipart_start_async (remote_command,
+                           (gchar *)buffer->content,
+                           size,
+                           remote_path,
+                           recipe_data->cancellable,
+                           message_cb,
+                           remote_hup,
+                           recipe_data);
     xmlBufferFree (buffer);
-
-    // turn off message body accumulating
-    soup_message_body_set_accumulate (recipe_data->remote_msg->response_body, FALSE);
-    multipart_request_send_async (request, recipe_data->cancellable, message_cb, remote_hup, recipe_data);
-
     return FALSE;
 }
 
@@ -931,12 +909,13 @@ static void add_r_params(gchar *role, GSList *hostlist,
     g_free(hostarr);
 }
 
-static RecipeData *new_recipe_data(AppData *app_data, gchar *recipe_id)
+static RecipeData *new_recipe_data(AppData *app_data, gchar *recipe_id, gchar *host)
 {
     RecipeData *recipe_data = g_slice_new0(RecipeData);
     recipe_data->body = g_string_new(NULL);
     recipe_data->app_data = app_data;
     recipe_data->cancellable = g_cancellable_new();
+    recipe_data->host = g_strdup (host);
     // Prime the watchdog handler, give us 5 minutes to get things
     // going.
     recipe_data->timeout_handler_id = g_timeout_add_seconds_full (G_PRIORITY_DEFAULT,
@@ -955,7 +934,7 @@ static guint get_node_role(xmlNodePtr node, GHashTable *roletable,
     xmlChar *role = xmlGetNoNsProp(node, (xmlChar*)"role");
 
     if (role != NULL) {
-        gchar *host = (gchar*)soup_uri_get_host(recipe_data->remote_uri);
+        gchar *host = recipe_data->host; // FIXME Need to handle user@host
         GSList *hostlist = g_hash_table_lookup(roletable, role);
         if (hostlist == NULL) {
             hostlist = g_slist_prepend(hostlist, host);
@@ -1177,10 +1156,6 @@ parse_new_job (AppData *app_data)
                                                         NULL, 0);
         g_free (recipe_id);
 
-        if (app_data->addr_get_uri == NULL) {
-            app_data->addr_get_uri = recipe_data->remote_uri;
-        }
-
         // find task nodes
         xmlXPathObjectPtr task_nodes = get_node_set(app_data->xml_doc, node,
                                                     (xmlChar*)"task");
@@ -1312,9 +1287,7 @@ static gboolean add_recipe_host(const gchar *option_name, const gchar *value,
                                 gpointer data, GError **error) {
     AppData *app_data = (AppData*)data;
     gchar **args;
-    gchar *remote;
     gboolean result = TRUE;
-    SoupURI *remote_uri;
 
     args = g_strsplit(value, "=", 2);
     if (g_strv_length(args) != 2) {
@@ -1324,25 +1297,7 @@ static gboolean add_recipe_host(const gchar *option_name, const gchar *value,
         return FALSE;
     }
 
-    if (g_strrstr(args[1], ":") == NULL) {
-        remote = g_strdup_printf("http://%s:%d/run", args[1], DEFAULT_PORT);
-    } else {
-        remote = g_strdup_printf("http://%s/run", args[1]);
-    }
-
-    remote_uri = soup_uri_new(remote);
-    if (remote_uri == NULL) {
-        g_set_error(error, G_OPTION_ERROR, G_OPTION_ERROR_FAILED,
-            "Wrong URI format: %s.", remote);
-        result = FALSE;
-        goto cleanup;
-    }
-
-    RecipeData *recipe_data = new_recipe_data(app_data, args[0]);
-    recipe_data->remote_uri = remote_uri;
-
-cleanup:
-    g_free(remote);
+    new_recipe_data(app_data, args[0], args[1]);
     g_strfreev(args);
     return result;
 }
@@ -1359,7 +1314,6 @@ static void recipe_init(gchar *id, RecipeData *recipe_data,
 
 int main(int argc, char *argv[]) {
     gchar *job = NULL;
-    gboolean ipv6 = FALSE;
 
     AppData *app_data = g_slice_new0 (AppData);
 
@@ -1368,17 +1322,13 @@ int main(int argc, char *argv[]) {
             g_free, (GDestroyNotify)&restraint_free_recipe_data);
 
     GOptionEntry entries[] = {
-        {"ipv6", '6', 0, G_OPTION_ARG_NONE, &ipv6,
-            "Use IPV6 for communication", NULL },
-        {"port", 'p', 0, G_OPTION_ARG_INT, &app_data->port,
-            "Specify the port to listen on", "PORT" },
         { "job", 'j', 0, G_OPTION_ARG_STRING, &job,
             "Run job from file", "FILE" },
         { "run", 'r', 0, G_OPTION_ARG_STRING, &app_data->run_dir,
             "Continue interrupted job from DIR", "DIR" },
         { "host", 't', 0, G_OPTION_ARG_CALLBACK, &add_recipe_host,
             "Set host for a recipe with specific id.",
-            "<recipe_id>=<host>[:<port>]" },
+            "<recipe_id>=[<user>@]<host>" },
         { "verbose", 'v', G_OPTION_FLAG_NO_ARG, G_OPTION_ARG_CALLBACK,
             callback_parse_verbose, "Increase verbosity, up to three times.",
             NULL },
@@ -1398,28 +1348,6 @@ int main(int argc, char *argv[]) {
     gboolean parse_succeeded = g_option_context_parse(context, &argc, &argv,
             &app_data->error);
     g_option_context_free(context);
-
-    if (ipv6) {
-        app_data->address_family = SOUP_ADDRESS_FAMILY_IPV6;
-    } else {
-        app_data->address_family = SOUP_ADDRESS_FAMILY_IPV4;
-    }
-
-    SoupAddress *address = soup_address_new_any(app_data->address_family,
-                                                SOUP_ADDRESS_ANY_PORT);
-
-    session = soup_session_new_with_options("local-address", address,
-                                            "timeout", 120,
-                                            "idle-timeout", 120,
-                                            "max-conns", 20,
-                                            "max-conns-per-host", 1,
-                                            NULL);
-
-    if (app_data->run_dir && app_data->port) {
-        g_printerr ("You can't specify both run_dir and port\n");
-        g_printerr ("Try %s --help\n", argv[0]);
-        goto cleanup;
-    }
 
     if (job) {
         // if template job is passed in use it to generate our job
@@ -1472,9 +1400,6 @@ int main(int argc, char *argv[]) {
     pretty_results(app_data->run_dir);
 
 cleanup:
-    soup_session_abort(session);
-    g_object_unref(session);
-    g_object_unref(address);
     if (job != NULL) {
         g_free(job);
     }
